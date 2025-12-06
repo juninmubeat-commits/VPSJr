@@ -6,7 +6,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 9999
 
     steps:
       - name: Configure Core RDP Settings
@@ -46,9 +46,18 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Verificar se usuário já existe
+          try {
+              Get-LocalUser -Name "RDP" -ErrorAction Stop
+              Write-Host "User RDP already exists, resetting password..."
+              Set-LocalUser -Name "RDP" -Password $securePass
+          } catch {
+              Write-Host "Creating new user RDP..."
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          }
           
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
           
@@ -68,15 +77,22 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # HOSTNAME FIXO - sempre o mesmo
+          $hostname = "my-persistent-vps"
+          
+          # Tentar reconectar primeiro
+          Write-Host "Tentando reconectar ao Tailscale..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --force-reauth
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          while (-not $tsIP -and $retries -lt 20) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+              if (-not $tsIP) {
+                  Write-Host "Aguardando IP do Tailscale... tentativa $retries"
+                  Start-Sleep -Seconds 5
+              }
               $retries++
           }
           
@@ -84,11 +100,18 @@ jobs:
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
+          
+          Write-Host "✅ Conectado ao Tailscale!"
+          Write-Host "Hostname: $hostname"
+          Write-Host "IP: $tsIP"
+          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
       
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
           
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
@@ -96,18 +119,44 @@ jobs:
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "✅ TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Install WSL and Ubuntu (Persistência)
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Instalando WSL e Ubuntu..."
+          wsl --install --no-distribution
+          Start-Sleep -Seconds 30
+          wsl --install -d Ubuntu-22.04 --no-launch
+          Write-Host "✅ WSL e Ubuntu instalados!"
+
+      - name: Maintain Connection with Keepalive
+        run: |
+          Write-Host "`n=== 🚀 RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME.taila61bc7.ts.net"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "Password: $($env:RDP_CREDS -replace 'User: RDP \| Password: ','')"
+          Write-Host "========================`n"
           
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "💡 Para conectar do seu WSL:"
+          Write-Host "ssh RDP@$env:TAILSCALE_HOSTNAME"
+          Write-Host "ou"
+          Write-Host "ssh RDP@$env:TAILSCALE_IP"
+          Write-Host "`n"
+          
+          # Keep runner active with periodic checks
+          $counter = 0
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              $counter++
+              $uptime = (Get-Date) - (gcim Win32_OperatingSystem).LastBootUpTime
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 🟢 RDP Ativo | Uptime: $($uptime.Hours)h $($uptime.Minutes)m | Iteração: $counter"
+              
+              # Verificar se Tailscale ainda está conectado
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($tsStatus -notmatch "100.100") {
+                  Write-Warning "Tailscale desconectado! Reconectando..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TAILSCALE_HOSTNAME
+              }
+              
+              Start-Sleep -Seconds 120  # A cada 2 minutos
           }
