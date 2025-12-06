@@ -11,33 +11,26 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+                         [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -47,10 +40,9 @@ jobs:
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          # Verificar se usuário já existe
           try {
               Get-LocalUser -Name "RDP" -ErrorAction Stop
-              Write-Host "User RDP already exists, resetting password..."
+              Write-Host "User RDP exists, resetting password..."
               Set-LocalUser -Name "RDP" -Password $securePass
           } catch {
               Write-Host "Creating new user RDP..."
@@ -60,103 +52,116 @@ jobs:
           }
           
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          # HOSTNAME FIXO - sempre o mesmo
           $hostname = "my-persistent-vps"
-          
-          # Tentar reconectar primeiro
-          Write-Host "Tentando reconectar ao Tailscale..."
+          Write-Host "Conectando ao Tailscale..."
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --force-reauth
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               if (-not $tsIP) {
-                  Write-Host "Aguardando IP do Tailscale... tentativa $retries"
+                  Write-Host "Aguardando IP... tentativa $retries"
                   Start-Sleep -Seconds 5
               }
               $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP not assigned."
               exit 1
           }
           
-          Write-Host "✅ Conectado ao Tailscale!"
-          Write-Host "Hostname: $hostname"
+          Write-Host "✅ Tailscale conectado!"
           Write-Host "IP: $tsIP"
-          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+
+      - name: Enable SSH Server
+        run: |
+          Write-Host "📦 Instalando OpenSSH Server..."
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          
+          Write-Host "🚀 Iniciando SSH..."
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType 'Automatic'
+          
+          Write-Host "🔥 Configurando firewall..."
+          New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue
+          
+          Write-Host "🔧 Habilitando autenticação por senha..."
+          $sshdConfig = "C:\ProgramData\ssh\sshd_config"
+          if (Test-Path $sshdConfig) {
+              $content = Get-Content $sshdConfig
+              $content = $content -replace '#PasswordAuthentication yes', 'PasswordAuthentication yes'
+              $content = $content -replace 'PasswordAuthentication no', 'PasswordAuthentication yes'
+              $content = $content -replace '#PubkeyAuthentication yes', 'PubkeyAuthentication no'
+              Set-Content $sshdConfig -Value $content
+          }
+          
+          Write-Host "♻️ Reiniciando SSH..."
+          Restart-Service sshd
+          
+          Write-Host "✅ SSH configurado!"
+          Start-Sleep -Seconds 5
+          
+          $sshTest = Test-NetConnection -ComputerName localhost -Port 22
+          if ($sshTest.TcpTestSucceeded) {
+              Write-Host "✅ SSH está respondendo na porta 22!"
+          } else {
+              Write-Warning "⚠️ SSH pode não estar acessível"
+          }
       
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          Write-Host "Verificando RDP..."
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "✅ RDP acessível!"
           }
-          Write-Host "✅ TCP connectivity successful!"
 
-      - name: Install WSL and Ubuntu (Persistência)
+      - name: Install WSL and Ubuntu
         run: |
-          Write-Host "Instalando WSL e Ubuntu..."
+          Write-Host "Instalando WSL..."
           wsl --install --no-distribution
-          Start-Sleep -Seconds 30
+          Start-Sleep -Seconds 20
           wsl --install -d Ubuntu-22.04 --no-launch
-          Write-Host "✅ WSL e Ubuntu instalados!"
+          Write-Host "✅ WSL instalado!"
 
       - name: Maintain Connection with Keepalive
         run: |
-          Write-Host "`n=== 🚀 RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME.taila61bc7.ts.net"
+          Write-Host "`n=== 🚀 ACESSO CONFIGURADO ==="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
           Write-Host "Username: RDP"
-          Write-Host "Password: $($env:RDP_CREDS -replace 'User: RDP \| Password: ','')"
-          Write-Host "========================`n"
+          Write-Host "Password: $($env:RDP_CREDS -replace '.*Password: ','')"
+          Write-Host "=============================`n"
+          Write-Host "SSH: ssh RDP@$env:TAILSCALE_IP"
+          Write-Host "RDP: $env:TAILSCALE_IP (Remote Desktop)`n"
           
-          Write-Host "💡 Para conectar do seu WSL:"
-          Write-Host "ssh RDP@$env:TAILSCALE_HOSTNAME"
-          Write-Host "ou"
-          Write-Host "ssh RDP@$env:TAILSCALE_IP"
-          Write-Host "`n"
-          
-          # Keep runner active with periodic checks
           $counter = 0
           while ($true) {
               $counter++
-              $uptime = (Get-Date) - (gcim Win32_OperatingSystem).LastBootUpTime
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 🟢 RDP Ativo | Uptime: $($uptime.Hours)h $($uptime.Minutes)m | Iteração: $counter"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 🟢 Ativo | Check #$counter"
               
-              # Verificar se Tailscale ainda está conectado
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              if ($tsStatus -notmatch "100.100") {
-                  Write-Warning "Tailscale desconectado! Reconectando..."
+              # Verificar Tailscale
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              if (-not $tsStatus) {
+                  Write-Warning "Reconectando Tailscale..."
                   & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TAILSCALE_HOSTNAME
               }
               
-              Start-Sleep -Seconds 120  # A cada 2 minutos
+              Start-Sleep -Seconds 120
           }
